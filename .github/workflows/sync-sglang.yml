@@ -1,0 +1,85 @@
+name: Mirror SGLang dev AMD64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  packages: write
+
+concurrency:
+  group: mirror-sglang-dev-amd64
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      REGISTRY_AUTH_FILE: ${{ runner.temp }}/sglang-ghcr-auth.json
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends skopeo jq
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | skopeo login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+
+      - name: Resolve, copy and verify linux/amd64
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_repo="docker.io/lmsysorg/sglang"
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          target_repo="ghcr.io/$owner/sglang-mirror"
+
+          skopeo inspect --retry-times 5 --raw "docker://$source_repo:dev" > "$RUNNER_TEMP/source.json"
+
+          if jq -e 'has("manifests")' "$RUNNER_TEMP/source.json" > /dev/null; then
+            digest="$(jq -er '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")][0].digest // error("linux/amd64 not found")' "$RUNNER_TEMP/source.json")"
+          else
+            digest="$(skopeo manifest-digest "$RUNNER_TEMP/source.json")"
+          fi
+
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          skopeo inspect --retry-times 5 --config "docker://$source_repo@$digest" |
+            jq -e '.os == "linux" and .architecture == "amd64"' > /dev/null
+
+          echo "Source: $source_repo@$digest"
+          echo "Destination: $target_repo:dev-amd64"
+
+          skopeo --override-os linux --override-arch amd64 copy --retry-times 5 --preserve-digests "docker://$source_repo@$digest" "docker://$target_repo:dev-amd64"
+
+          skopeo inspect --retry-times 5 --raw "docker://$target_repo:dev-amd64" > "$RUNNER_TEMP/destination.json"
+          actual="$(skopeo manifest-digest "$RUNNER_TEMP/destination.json")"
+
+          if [ "$actual" != "$digest" ]; then
+            echo "ERROR: source and destination digests differ"
+            exit 1
+          fi
+
+          {
+            echo "## SGLang mirror ready"
+            echo
+            echo "- Platform: linux/amd64"
+            echo "- Source digest: $digest"
+            echo "- GHCR digest: $actual"
+            echo "- Image: $target_repo:dev-amd64"
+            echo
+            echo "Pinned pull command:"
+            echo
+            echo "docker pull --platform=linux/amd64 $target_repo@$digest"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out
+        if: always()
+        run: |
+          if [ -f "$REGISTRY_AUTH_FILE" ]; then
+            skopeo logout ghcr.io
+          fi
